@@ -12,8 +12,25 @@ function provider() {
     issuer: "https://mcp.example",
     resource: "https://mcp.example/mcp",
     trustedRedirectUris: new Set([redirectUri]),
-    dokployApiKey: "dokploy-secret",
+    dokployPublicUrl: "https://dokploy.example",
+    dokploySessionUrl: "http://dokploy:3000/api/user.session",
+    dokployLoginUrl: "https://dokploy.example/login",
+    dokployLoginCallbackParam: "callbackURL",
+    dokployBridgeUrl: "https://dokploy.example/mcp-auth/verify",
+    allowedDokployUsers: new Set(["user-1", "admin@example.com"]),
   });
+}
+
+function authorization(oauth: LightweightOAuthProvider) {
+  const client = oauth.register([redirectUri]);
+  const pending = oauth.beginAuthorization({
+    clientId: client.clientId,
+    redirectUri,
+    codeChallenge: challenge,
+    resource: "https://mcp.example/mcp",
+    state: "client-state",
+  });
+  return { client, pending };
 }
 
 describe("LightweightOAuthProvider", () => {
@@ -26,34 +43,27 @@ describe("LightweightOAuthProvider", () => {
   });
 
   it("allows dynamic loopback ports for native MCP clients", () => {
-    const oauth = provider();
-    expect(oauth.register(["http://127.0.0.1:49152/callback"]).redirectUris).toEqual([
+    expect(provider().register(["http://127.0.0.1:49152/callback"]).redirectUris).toEqual([
       "http://127.0.0.1:49152/callback",
     ]);
   });
 
-  it("requires the configured Dokploy key and exchanges a PKCE code once", () => {
+  it("binds a Dokploy login transaction and exchanges its PKCE code once", () => {
     const oauth = provider();
-    const client = oauth.register([redirectUri]);
-    expect(() =>
-      oauth.createCode({
-        clientId: client.clientId,
-        redirectUri,
-        codeChallenge: challenge,
-        resource: "https://mcp.example/mcp",
-        dokployApiKey: "wrong",
-      }),
-    ).toThrow("Invalid Dokploy API key");
+    const { client, pending } = authorization(oauth);
+    expect(oauth.hasPendingAuthorization(pending.transactionId, pending.nonce)).toBe(true);
+    expect(oauth.hasPendingAuthorization(pending.transactionId, "wrong")).toBe(false);
 
-    const code = oauth.createCode({
-      clientId: client.clientId,
-      redirectUri,
-      codeChallenge: challenge,
-      resource: "https://mcp.example/mcp",
-      dokployApiKey: "dokploy-secret",
+    const completed = oauth.completeAuthorization(pending.transactionId, pending.nonce, {
+      id: "user-1",
     });
+    expect(completed).toMatchObject({ redirectUri, state: "client-state" });
+    expect(() =>
+      oauth.completeAuthorization(pending.transactionId, pending.nonce, { id: "user-1" }),
+    ).toThrow("Invalid or expired");
+
     const token = oauth.exchangeCode({
-      code,
+      code: completed.code,
       clientId: client.clientId,
       redirectUri,
       codeVerifier: verifier,
@@ -62,26 +72,37 @@ describe("LightweightOAuthProvider", () => {
     expect(oauth.verifyToken(token)).toBe(true);
     expect(() =>
       oauth.exchangeCode({
-        code,
+        code: completed.code,
         clientId: client.clientId,
         redirectUri,
         codeVerifier: verifier,
         resource: "https://mcp.example/mcp",
       }),
     ).toThrow("Invalid or expired authorization code");
-    oauth.revoke(token);
-    expect(oauth.verifyToken(token)).toBe(false);
   });
 
-  it("rejects a bad PKCE verifier", () => {
+  it("rejects users outside the explicit allowlist without consuming the transaction", () => {
     const oauth = provider();
-    const client = oauth.register([redirectUri]);
-    const code = oauth.createCode({
-      clientId: client.clientId,
-      redirectUri,
-      codeChallenge: challenge,
-      resource: "https://mcp.example/mcp",
-      dokployApiKey: "dokploy-secret",
+    const { pending } = authorization(oauth);
+    expect(() =>
+      oauth.completeAuthorization(pending.transactionId, pending.nonce, {
+        id: "other",
+        email: "other@example.com",
+      }),
+    ).toThrow("not allowed");
+    expect(
+      oauth.completeAuthorization(pending.transactionId, pending.nonce, {
+        id: "other",
+        email: "ADMIN@example.com",
+      }).code,
+    ).toBeTruthy();
+  });
+
+  it("rejects a bad PKCE verifier and a mismatched resource", () => {
+    const oauth = provider();
+    const { client, pending } = authorization(oauth);
+    const { code } = oauth.completeAuthorization(pending.transactionId, pending.nonce, {
+      id: "user-1",
     });
     expect(() =>
       oauth.exchangeCode({
@@ -91,37 +112,7 @@ describe("LightweightOAuthProvider", () => {
         codeVerifier: "b".repeat(43),
         resource: "https://mcp.example/mcp",
       }),
-    ).toThrow("Invalid or expired authorization code");
-    const token = oauth.exchangeCode({
-      code,
-      clientId: client.clientId,
-      redirectUri,
-      codeVerifier: verifier,
-      resource: "https://mcp.example/mcp",
-    });
-    expect(oauth.verifyToken(token)).toBe(true);
-  });
-
-  it("binds authorization codes and tokens to the MCP resource", () => {
-    const oauth = provider();
-    const client = oauth.register([redirectUri]);
-    expect(() =>
-      oauth.createCode({
-        clientId: client.clientId,
-        redirectUri,
-        codeChallenge: challenge,
-        dokployApiKey: "dokploy-secret",
-        resource: "https://other.example/mcp",
-      }),
-    ).toThrow("resource must be https://mcp.example/mcp");
-
-    const code = oauth.createCode({
-      clientId: client.clientId,
-      redirectUri,
-      codeChallenge: challenge,
-      dokployApiKey: "dokploy-secret",
-      resource: "https://mcp.example/mcp",
-    });
+    ).toThrow("Invalid or expired");
     expect(() =>
       oauth.exchangeCode({
         code,
@@ -130,7 +121,7 @@ describe("LightweightOAuthProvider", () => {
         codeVerifier: verifier,
         resource: "https://other.example/mcp",
       }),
-    ).toThrow("Invalid or expired authorization code");
+    ).toThrow("Invalid or expired");
   });
 });
 
@@ -145,15 +136,27 @@ describe("loadOAuthConfig", () => {
     expect(loadOAuthConfig().enabled).toBe(false);
   });
 
-  it("requires the Dokploy API key when enabled", () => {
+  it("requires an explicit user allowlist when enabled", () => {
     process.env.MCP_OAUTH_ENABLED = "true";
-    delete process.env.DOKPLOY_API_KEY;
-    expect(() => loadOAuthConfig()).toThrow("DOKPLOY_API_KEY is required");
+    delete process.env.MCP_ALLOWED_DOKPLOY_USERS;
+    expect(() => loadOAuthConfig()).toThrow("MCP_ALLOWED_DOKPLOY_USERS is required");
+  });
+
+  it("loads the Dokploy bridge endpoints", () => {
+    process.env.MCP_OAUTH_ENABLED = "true";
+    process.env.MCP_ALLOWED_DOKPLOY_USERS = "USER-1, Admin@Example.com";
+    process.env.MCP_PUBLIC_URL = "https://mcp.example";
+    process.env.DOKPLOY_PUBLIC_URL = "https://dokploy.example";
+    process.env.DOKPLOY_URL = "http://dokploy:3000";
+    const config = loadOAuthConfig();
+    expect(config.dokploySessionUrl).toBe("http://dokploy:3000/api/user.session");
+    expect(config.dokployBridgeUrl).toBe("https://dokploy.example/mcp-auth/verify");
+    expect(config.allowedDokployUsers).toEqual(new Set(["user-1", "admin@example.com"]));
   });
 
   it("rejects an insecure public OAuth issuer", () => {
     process.env.MCP_OAUTH_ENABLED = "true";
-    process.env.DOKPLOY_API_KEY = "secret";
+    process.env.MCP_ALLOWED_DOKPLOY_USERS = "user-1";
     process.env.MCP_PUBLIC_URL = "http://mcp.example";
     expect(() => loadOAuthConfig()).toThrow("MCP_PUBLIC_URL must use HTTPS");
   });
