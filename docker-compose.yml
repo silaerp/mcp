@@ -2,8 +2,8 @@ services:
   dokploy-mcp-http:
     build: .
     container_name: dokploy-mcp-http
-    ports:
-      - "${EXTERNAL_PORT:-3000}:3000"
+    # ports:
+    #   - "${EXTERNAL_PORT:-3000}:3000"
     environment:
       - MCP_TRANSPORT=${MCP_TRANSPORT:-http}
       - DOKPLOY_URL=${DOKPLOY_URL:-https://your-dokploy-server.com}
