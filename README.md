@@ -314,9 +314,9 @@ The configuration on Windows is slightly different compared to Linux or macOS. U
 | `DOKPLOY_TIMEOUT` | No | Request timeout in milliseconds (default: `30000`) |
 | `DOKPLOY_RETRY_ATTEMPTS` | No | Number of retry attempts (default: `3`) |
 | `DOKPLOY_RETRY_DELAY` | No | Delay between retries in milliseconds (default: `1000`) |
-| `MCP_OAUTH_ENABLED` | No | Enables the lightweight OAuth 2.1 authorization-code facade for HTTP transports (default: `false`). |
+| `MCP_OAUTH_ENABLED` | No | Enables lightweight, single-operator OAuth 2.1 API-key authorization for HTTP transports (default: `false`). |
 | `MCP_PUBLIC_URL` | With OAuth | Public origin of this MCP server, without the `/mcp` path (for example `https://mcp.example.com`). |
-| `MCP_OAUTH_TRUSTED_REDIRECT_URIS` | With OAuth | Comma-separated, exact OAuth client callback allowlist. HTTPS is required except for localhost development. |
+| `MCP_OAUTH_TRUSTED_REDIRECT_URIS` | No | Comma-separated exact allowlist for hosted HTTPS client callbacks. Native-client HTTP callbacks on `localhost`, `127.0.0.1`, and `[::1]` are allowed automatically and remain exact after registration. |
 | `DOKPLOY_REDACT_ENV` | No | Redacts secret-bearing fields (env vars, compose files, passwords, tokens, keys) from API responses before they reach the MCP client (default: `true`). Set to `false` only if you explicitly need raw secret values in LLM context. |
 | `DOKPLOY_REDACT_FIELDS` | No | Comma-separated list of response field names to redact when `DOKPLOY_REDACT_ENV=true`. Matched case-insensitively at any nesting depth. Defaults to: `env`, `buildArgs`, `composeFile`, `dockerCompose`, `environment`, `buildSecrets`, `previewBuildSecrets`, `password`, `currentPassword`, `appPassword`, `databasePassword`, `databaseRootPassword`, `redisPassword`, `mariadbPassword`, `mongoPassword`, `mysqlPassword`, `postgresPassword`, `registryPassword`, `token`, `accessToken`, `appToken`, `apiToken`, `botToken`, `refreshToken`, `secret`, `clientSecret`, `apiKey`, `secretAccessKey`, `accessKey`, `licenseKey`, `userKey`, `privateKey`, `privateKeyPass`, `encPrivateKey`, `encPrivateKeyPass`, `sshKey`, `sshPrivateKey`, `customGitSSHKey`, `dockerAuth`. |
 
@@ -369,30 +369,34 @@ MCP_TRANSPORT=http npx -y @dokploy/mcp
 | `/sse` | GET | SSE stream initialization |
 | `/messages` | POST | Client message posting |
 
-### OAuth 2.1 for remote clients
+### OAuth 2.1 API-key authorization for remote clients
 
 HTTP and SSE endpoints are unauthenticated by default for backward compatibility. Set
 `MCP_OAUTH_ENABLED=true` to enable the built-in authorization-code flow with mandatory PKCE S256,
-dynamic client registration, token revocation, and MCP/RFC 9728 discovery metadata. `/health`
-remains public.
+MCP resource binding, dynamic client registration, token revocation, and MCP/RFC 9728 discovery
+metadata. `/health` remains public.
 
-The authorization screen asks for the same Dokploy API key configured in `DOKPLOY_API_KEY`. The
-key is compared in constant time and is never put in an authorization code or access token. This
-keeps login tied to the configured Dokploy deployment without copying its powerful credential to
-the MCP client. Access tokens and registered clients are intentionally kept in memory; restarting
-the container signs clients out.
+The authorization screen asks for the same Dokploy API key configured in `DOKPLOY_API_KEY`. This
+is single-operator API-key authorization, **not** a Dokploy account or SSO login. The key is
+compared in constant time and is never put in an authorization code or access token. This keeps
+authorization tied to the configured Dokploy deployment without copying its powerful credential
+to the MCP client's configuration. Access tokens and registered clients are intentionally kept in
+memory; restarting the container signs clients out.
 
 ```env
 MCP_OAUTH_ENABLED=true
 MCP_PUBLIC_URL=https://mcp.example.com
-MCP_OAUTH_TRUSTED_REDIRECT_URIS=https://client.example.com/oauth/callback,http://localhost:33418/callback
+MCP_OAUTH_TRUSTED_REDIRECT_URIS=https://hosted-client.example.com/oauth/callback
 ```
 
-Every callback must exactly match the trusted allowlist. Do not use wildcard callbacks. Put the
-server behind HTTPS in production and keep port `3000` private when terminating TLS at a reverse
-proxy. This lightweight flow is intended for a single trusted Dokploy operator; use a persistent
-external identity provider/proxy when multiple users, independent identities, or durable sessions
-are required.
+Hosted HTTPS callbacks must exactly match the trusted allowlist; do not use wildcards. Loopback
+HTTP callbacks are accepted automatically so native clients can choose an ephemeral port, then
+must match that registered URI exactly during authorization and token exchange. Put the server
+behind HTTPS in production and keep port `3000` private when terminating TLS at a reverse proxy.
+`MCP_PUBLIC_URL` must be an HTTPS origin in production and the MCP resource is always its `/mcp`
+URL. This lightweight flow is intended for a single trusted Dokploy operator; use a persistent
+external identity provider/proxy when multiple users, genuine Dokploy account login, independent
+identities, or durable sessions are required.
 
 ## Available Tools (508)
 

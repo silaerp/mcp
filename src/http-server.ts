@@ -6,7 +6,7 @@ import { serve } from "@hono/node-server";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { createServer } from "./server.js";
 import { createLogger } from "./utils/logger.js";
 import { LightweightOAuthProvider, loadOAuthConfig, oauthMiddleware } from "./utils/oauth.js";
@@ -42,8 +42,9 @@ export async function main() {
 
   if (oauth.config.enabled) {
     const protectedResourceMetadata = {
-      resource: `${oauth.config.issuer}/mcp`,
+      resource: oauth.config.resource,
       authorization_servers: [oauth.config.issuer],
+      scopes_supported: ["mcp"],
     };
     app.get("/.well-known/oauth-protected-resource", (c) => c.json(protectedResourceMetadata));
     app.get("/.well-known/oauth-protected-resource/mcp", (c) =>
@@ -62,24 +63,47 @@ export async function main() {
         grant_types_supported: ["authorization_code"],
         code_challenge_methods_supported: ["S256"],
         token_endpoint_auth_methods_supported: ["none"],
+        scopes_supported: ["mcp"],
       }),
     );
     app.post("/oauth/register", async (c) => {
       try {
-        const client = oauth.register((await c.req.json()).redirect_uris);
+        const metadata = await c.req.json();
+        if (
+          metadata.token_endpoint_auth_method !== undefined &&
+          metadata.token_endpoint_auth_method !== "none"
+        ) {
+          throw new Error(
+            "Only public clients using token_endpoint_auth_method=none are supported",
+          );
+        }
+        if (
+          metadata.grant_types !== undefined &&
+          (!Array.isArray(metadata.grant_types) ||
+            metadata.grant_types.some((grant: unknown) => grant !== "authorization_code"))
+        ) {
+          throw new Error("Only the authorization_code grant is supported");
+        }
+        const client = oauth.register(metadata.redirect_uris);
+        c.header("Cache-Control", "no-store");
         return c.json(
           {
             client_id: client.clientId,
             redirect_uris: client.redirectUris,
             token_endpoint_auth_method: "none",
+            grant_types: ["authorization_code"],
+            response_types: ["code"],
           },
           201,
         );
       } catch (error) {
+        const description = String(error instanceof Error ? error.message : error);
         return c.json(
           {
-            error: "invalid_redirect_uri",
-            error_description: String(error instanceof Error ? error.message : error),
+            error: description.includes("redirect")
+              ? "invalid_redirect_uri"
+              : "invalid_client_metadata",
+            error_description: description,
           },
           400,
         );
@@ -87,8 +111,14 @@ export async function main() {
     });
     app.get("/oauth/authorize", (c) => {
       const query = new URLSearchParams(c.req.query()).toString();
+      c.header("Cache-Control", "no-store");
+      c.header("Referrer-Policy", "no-referrer");
+      c.header(
+        "Content-Security-Policy",
+        "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+      );
       return c.html(
-        `<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>Dokploy login</title></head><body><main><h1>Sign in with Dokploy</h1><p>Enter the API key for this Dokploy MCP deployment. It is checked in constant time and is never stored.</p><form method="post" action="/oauth/authorize?${escapeHtml(query)}"><label>Dokploy API key <input name="dokploy_api_key" type="password" required autocomplete="off"></label><button type="submit">Authorize</button></form></main></body></html>`,
+        `<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>Authorize Dokploy MCP</title></head><body><main><h1>Authorize Dokploy MCP</h1><p>Enter the API key for this Dokploy MCP deployment. This is single-operator API-key authorization, not a Dokploy account or SSO login. The key is checked in constant time and is never stored.</p><p>After approval, you will return to <strong>${escapeHtml(callbackHost(c.req.query("redirect_uri")))}</strong>.</p><form method="post" action="/oauth/authorize?${escapeHtml(query)}"><label>Dokploy API key <input name="dokploy_api_key" type="password" required autocomplete="off"></label><button type="submit">Authorize</button></form></main></body></html>`,
       );
     });
     app.post("/oauth/authorize", async (c) => {
@@ -100,11 +130,15 @@ export async function main() {
           c.req.query("code_challenge_method") !== "S256"
         )
           throw new Error("Only authorization code with PKCE S256 is supported");
+        if (!oauth.isClientRedirectUri(c.req.query("client_id") ?? "", redirectUri)) {
+          throw new Error("Unknown client or unregistered redirect URI");
+        }
         const form = await c.req.parseBody();
         const code = oauth.createCode({
           clientId: c.req.query("client_id") ?? "",
           redirectUri,
           codeChallenge: c.req.query("code_challenge") ?? "",
+          resource: c.req.query("resource") ?? "",
           dokployApiKey: String(form.dokploy_api_key ?? ""),
         });
         const target = new URL(redirectUri);
@@ -112,7 +146,17 @@ export async function main() {
         if (state) target.searchParams.set("state", state);
         return c.redirect(target.toString());
       } catch (error) {
-        return c.text(error instanceof Error ? error.message : "Authorization failed", 400);
+        const message = error instanceof Error ? error.message : "Authorization failed";
+        if (oauth.isClientRedirectUri(c.req.query("client_id") ?? "", redirectUri)) {
+          return redirectOAuthError(
+            c,
+            redirectUri,
+            state,
+            message === "Invalid Dokploy API key" ? "access_denied" : "invalid_request",
+            message,
+          );
+        }
+        return c.text(message, 400);
       }
     });
     app.post("/oauth/token", async (c) => {
@@ -124,8 +168,16 @@ export async function main() {
           clientId: String(form.client_id ?? ""),
           redirectUri: String(form.redirect_uri ?? ""),
           codeVerifier: String(form.code_verifier ?? ""),
+          resource: String(form.resource ?? ""),
         });
-        return c.json({ access_token: accessToken, token_type: "Bearer", expires_in: 28800 });
+        c.header("Cache-Control", "no-store");
+        c.header("Pragma", "no-cache");
+        return c.json({
+          access_token: accessToken,
+          token_type: "Bearer",
+          expires_in: 28800,
+          scope: "mcp",
+        });
       } catch (error) {
         return c.json(
           {
@@ -139,6 +191,7 @@ export async function main() {
     app.post("/oauth/revoke", async (c) => {
       const form = await c.req.parseBody();
       oauth.revoke(String(form.token ?? ""));
+      c.header("Cache-Control", "no-store");
       return c.body(null, 200);
     });
     app.use("/mcp", oauthMiddleware(oauth));
@@ -313,6 +366,28 @@ function escapeHtml(value: string): string {
       ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character] ??
       character,
   );
+}
+
+function callbackHost(value: string | undefined): string {
+  try {
+    return value ? new URL(value).host : "the requesting MCP client";
+  } catch {
+    return "the requesting MCP client";
+  }
+}
+
+function redirectOAuthError(
+  c: Context,
+  redirectUri: string,
+  state: string | undefined,
+  error: string,
+  description: string,
+) {
+  const target = new URL(redirectUri);
+  target.searchParams.set("error", error);
+  target.searchParams.set("error_description", description);
+  if (state) target.searchParams.set("state", state);
+  return c.redirect(target.toString());
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

@@ -8,6 +8,7 @@ const MAX_EPHEMERAL_RECORDS = 1_000;
 export interface OAuthConfig {
   enabled: boolean;
   issuer: string;
+  resource: string;
   trustedRedirectUris: Set<string>;
   dokployApiKey: string;
 }
@@ -21,13 +22,14 @@ interface AuthorizationCode {
   clientId: string;
   redirectUri: string;
   codeChallenge: string;
+  resource: string;
   expiresAt: number;
 }
 
 export class LightweightOAuthProvider {
   private readonly clients = new Map<string, Client>();
   private readonly codes = new Map<string, AuthorizationCode>();
-  private readonly tokens = new Map<string, number>();
+  private readonly tokens = new Map<string, { expiresAt: number; resource: string }>();
 
   constructor(readonly config: OAuthConfig) {}
 
@@ -36,8 +38,10 @@ export class LightweightOAuthProvider {
       throw new Error("redirect_uris must be a non-empty array");
     }
     const normalized = redirectUris.map((uri) => normalizeRedirectUri(uri));
-    if (normalized.some((uri) => !this.config.trustedRedirectUris.has(uri))) {
-      throw new Error("Every redirect URI must be listed in MCP_OAUTH_TRUSTED_REDIRECT_URIS");
+    if (normalized.some((uri) => !this.isTrustedRedirectUri(uri))) {
+      throw new Error(
+        "HTTPS redirect URIs must be listed in MCP_OAUTH_TRUSTED_REDIRECT_URIS; loopback HTTP callbacks are allowed automatically",
+      );
     }
     const client = { clientId: randomToken(), redirectUris: normalized };
     this.clients.set(client.clientId, client);
@@ -49,11 +53,11 @@ export class LightweightOAuthProvider {
     clientId: string;
     redirectUri: string;
     codeChallenge: string;
+    resource: string;
     dokployApiKey: string;
   }): string {
     const redirectUri = normalizeRedirectUri(input.redirectUri);
-    const client = this.clients.get(input.clientId);
-    if (!client?.redirectUris.includes(redirectUri)) {
+    if (!this.isClientRedirectUri(input.clientId, redirectUri)) {
       throw new Error("Unknown client or unregistered redirect URI");
     }
     if (!/^[A-Za-z0-9_-]{43,128}$/.test(input.codeChallenge)) {
@@ -62,11 +66,15 @@ export class LightweightOAuthProvider {
     if (!secretEquals(input.dokployApiKey, this.config.dokployApiKey)) {
       throw new Error("Invalid Dokploy API key");
     }
+    if (input.resource !== this.config.resource) {
+      throw new Error(`resource must be ${this.config.resource}`);
+    }
     const code = randomToken();
     this.codes.set(code, {
       clientId: input.clientId,
       redirectUri,
       codeChallenge: input.codeChallenge,
+      resource: input.resource,
       expiresAt: Date.now() + CODE_TTL_MS,
     });
     capMap(this.codes);
@@ -78,31 +86,38 @@ export class LightweightOAuthProvider {
     clientId: string;
     redirectUri: string;
     codeVerifier: string;
+    resource: string;
   }): string {
     const redirectUri = normalizeRedirectUri(input.redirectUri);
     const authorization = this.codes.get(input.code);
-    this.codes.delete(input.code);
     const challenge = createHash("sha256").update(input.codeVerifier).digest("base64url");
     if (
       !authorization ||
       authorization.expiresAt < Date.now() ||
       authorization.clientId !== input.clientId ||
       authorization.redirectUri !== redirectUri ||
+      authorization.resource !== input.resource ||
+      input.resource !== this.config.resource ||
       !secretEquals(challenge, authorization.codeChallenge)
     ) {
       throw new Error("Invalid or expired authorization code");
     }
+    this.codes.delete(input.code);
     const token = randomToken();
-    this.tokens.set(token, Date.now() + TOKEN_TTL_MS);
+    this.tokens.set(token, { expiresAt: Date.now() + TOKEN_TTL_MS, resource: input.resource });
     capMap(this.tokens);
     return token;
   }
 
-  verifyToken(token: string | undefined): boolean {
+  verifyToken(token: string | undefined, resource = this.config.resource): boolean {
     if (!token) return false;
-    const expiresAt = this.tokens.get(token);
-    if (!expiresAt || expiresAt < Date.now()) {
-      if (expiresAt) this.tokens.delete(token);
+    const authorization = this.tokens.get(token);
+    if (
+      !authorization ||
+      authorization.expiresAt < Date.now() ||
+      authorization.resource !== resource
+    ) {
+      if (authorization) this.tokens.delete(token);
       return false;
     }
     return true;
@@ -111,11 +126,27 @@ export class LightweightOAuthProvider {
   revoke(token: string): void {
     this.tokens.delete(token);
   }
+
+  isClientRedirectUri(clientId: string, redirectUri: string): boolean {
+    try {
+      const normalized = normalizeRedirectUri(redirectUri);
+      return this.clients.get(clientId)?.redirectUris.includes(normalized) ?? false;
+    } catch {
+      return false;
+    }
+  }
+
+  private isTrustedRedirectUri(redirectUri: string): boolean {
+    const url = new URL(redirectUri);
+    return isLoopbackUrl(url) || this.config.trustedRedirectUris.has(redirectUri);
+  }
 }
 
 export function loadOAuthConfig(): OAuthConfig {
   const enabled = parseBoolean(process.env.MCP_OAUTH_ENABLED);
-  const issuer = (process.env.MCP_PUBLIC_URL ?? "http://localhost:3000").replace(/\/$/, "");
+  const issuerUrl = normalizeIssuer(process.env.MCP_PUBLIC_URL ?? "http://localhost:3000");
+  const issuer = issuerUrl.toString().replace(/\/$/, "");
+  const resource = `${issuer}/mcp`;
   const trustedRedirectUris = new Set(
     (process.env.MCP_OAUTH_TRUSTED_REDIRECT_URIS ?? "")
       .split(",")
@@ -123,15 +154,13 @@ export function loadOAuthConfig(): OAuthConfig {
       .filter(Boolean)
       .map(normalizeRedirectUri),
   );
-  if (enabled && trustedRedirectUris.size === 0) {
-    throw new Error("MCP_OAUTH_TRUSTED_REDIRECT_URIS is required when MCP_OAUTH_ENABLED=true");
-  }
   if (enabled && !process.env.DOKPLOY_API_KEY) {
     throw new Error("DOKPLOY_API_KEY is required when MCP_OAUTH_ENABLED=true");
   }
   return {
     enabled,
     issuer,
+    resource,
     trustedRedirectUris,
     dokployApiKey: process.env.DOKPLOY_API_KEY ?? "",
   };
@@ -141,10 +170,10 @@ export function oauthMiddleware(provider: LightweightOAuthProvider): MiddlewareH
   return async (c, next) => {
     const header = c.req.header("authorization");
     const token = header?.match(/^Bearer\s+(.+)$/i)?.[1];
-    if (provider.verifyToken(token)) return next();
+    if (provider.verifyToken(token, provider.config.resource)) return next();
     c.header(
       "WWW-Authenticate",
-      `Bearer resource_metadata="${provider.config.issuer}/.well-known/oauth-protected-resource/mcp"`,
+      `Bearer resource_metadata="${provider.config.issuer}/.well-known/oauth-protected-resource/mcp", scope="mcp"`,
     );
     return c.json(
       { error: "unauthorized", error_description: "A valid OAuth access token is required" },
@@ -156,15 +185,30 @@ export function oauthMiddleware(provider: LightweightOAuthProvider): MiddlewareH
 function normalizeRedirectUri(value: unknown): string {
   if (typeof value !== "string") throw new Error("Redirect URIs must be strings");
   const url = new URL(value);
-  if (
-    url.hash ||
-    (url.protocol !== "https:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1")
-  ) {
+  if (url.hash || (url.protocol !== "https:" && !isLoopbackUrl(url))) {
     throw new Error(
       "Redirect URIs must use HTTPS (localhost HTTP is allowed) and cannot contain fragments",
     );
   }
   return url.toString();
+}
+
+function normalizeIssuer(value: string): URL {
+  const url = new URL(value);
+  if (url.search || url.hash || url.username || url.password) {
+    throw new Error("MCP_PUBLIC_URL cannot contain credentials, a query, or a fragment");
+  }
+  if (url.pathname !== "/") {
+    throw new Error("MCP_PUBLIC_URL must be an origin without a path");
+  }
+  if (url.protocol !== "https:" && !isLoopbackUrl(url)) {
+    throw new Error("MCP_PUBLIC_URL must use HTTPS except on localhost or 127.0.0.1");
+  }
+  return url;
+}
+
+function isLoopbackUrl(url: URL): boolean {
+  return url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
 }
 
 function randomToken(): string {

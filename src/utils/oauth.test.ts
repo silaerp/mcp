@@ -10,6 +10,7 @@ function provider() {
   return new LightweightOAuthProvider({
     enabled: true,
     issuer: "https://mcp.example",
+    resource: "https://mcp.example/mcp",
     trustedRedirectUris: new Set([redirectUri]),
     dokployApiKey: "dokploy-secret",
   });
@@ -24,6 +25,13 @@ describe("LightweightOAuthProvider", () => {
     );
   });
 
+  it("allows dynamic loopback ports for native MCP clients", () => {
+    const oauth = provider();
+    expect(oauth.register(["http://127.0.0.1:49152/callback"]).redirectUris).toEqual([
+      "http://127.0.0.1:49152/callback",
+    ]);
+  });
+
   it("requires the configured Dokploy key and exchanges a PKCE code once", () => {
     const oauth = provider();
     const client = oauth.register([redirectUri]);
@@ -32,6 +40,7 @@ describe("LightweightOAuthProvider", () => {
         clientId: client.clientId,
         redirectUri,
         codeChallenge: challenge,
+        resource: "https://mcp.example/mcp",
         dokployApiKey: "wrong",
       }),
     ).toThrow("Invalid Dokploy API key");
@@ -40,6 +49,7 @@ describe("LightweightOAuthProvider", () => {
       clientId: client.clientId,
       redirectUri,
       codeChallenge: challenge,
+      resource: "https://mcp.example/mcp",
       dokployApiKey: "dokploy-secret",
     });
     const token = oauth.exchangeCode({
@@ -47,10 +57,17 @@ describe("LightweightOAuthProvider", () => {
       clientId: client.clientId,
       redirectUri,
       codeVerifier: verifier,
+      resource: "https://mcp.example/mcp",
     });
     expect(oauth.verifyToken(token)).toBe(true);
     expect(() =>
-      oauth.exchangeCode({ code, clientId: client.clientId, redirectUri, codeVerifier: verifier }),
+      oauth.exchangeCode({
+        code,
+        clientId: client.clientId,
+        redirectUri,
+        codeVerifier: verifier,
+        resource: "https://mcp.example/mcp",
+      }),
     ).toThrow("Invalid or expired authorization code");
     oauth.revoke(token);
     expect(oauth.verifyToken(token)).toBe(false);
@@ -63,6 +80,7 @@ describe("LightweightOAuthProvider", () => {
       clientId: client.clientId,
       redirectUri,
       codeChallenge: challenge,
+      resource: "https://mcp.example/mcp",
       dokployApiKey: "dokploy-secret",
     });
     expect(() =>
@@ -71,6 +89,46 @@ describe("LightweightOAuthProvider", () => {
         clientId: client.clientId,
         redirectUri,
         codeVerifier: "b".repeat(43),
+        resource: "https://mcp.example/mcp",
+      }),
+    ).toThrow("Invalid or expired authorization code");
+    const token = oauth.exchangeCode({
+      code,
+      clientId: client.clientId,
+      redirectUri,
+      codeVerifier: verifier,
+      resource: "https://mcp.example/mcp",
+    });
+    expect(oauth.verifyToken(token)).toBe(true);
+  });
+
+  it("binds authorization codes and tokens to the MCP resource", () => {
+    const oauth = provider();
+    const client = oauth.register([redirectUri]);
+    expect(() =>
+      oauth.createCode({
+        clientId: client.clientId,
+        redirectUri,
+        codeChallenge: challenge,
+        dokployApiKey: "dokploy-secret",
+        resource: "https://other.example/mcp",
+      }),
+    ).toThrow("resource must be https://mcp.example/mcp");
+
+    const code = oauth.createCode({
+      clientId: client.clientId,
+      redirectUri,
+      codeChallenge: challenge,
+      dokployApiKey: "dokploy-secret",
+      resource: "https://mcp.example/mcp",
+    });
+    expect(() =>
+      oauth.exchangeCode({
+        code,
+        clientId: client.clientId,
+        redirectUri,
+        codeVerifier: verifier,
+        resource: "https://other.example/mcp",
       }),
     ).toThrow("Invalid or expired authorization code");
   });
@@ -87,9 +145,16 @@ describe("loadOAuthConfig", () => {
     expect(loadOAuthConfig().enabled).toBe(false);
   });
 
-  it("requires a trusted redirect URI when enabled", () => {
+  it("requires the Dokploy API key when enabled", () => {
     process.env.MCP_OAUTH_ENABLED = "true";
-    delete process.env.MCP_OAUTH_TRUSTED_REDIRECT_URIS;
-    expect(() => loadOAuthConfig()).toThrow("MCP_OAUTH_TRUSTED_REDIRECT_URIS is required");
+    delete process.env.DOKPLOY_API_KEY;
+    expect(() => loadOAuthConfig()).toThrow("DOKPLOY_API_KEY is required");
+  });
+
+  it("rejects an insecure public OAuth issuer", () => {
+    process.env.MCP_OAUTH_ENABLED = "true";
+    process.env.DOKPLOY_API_KEY = "secret";
+    process.env.MCP_PUBLIC_URL = "http://mcp.example";
+    expect(() => loadOAuthConfig()).toThrow("MCP_PUBLIC_URL must use HTTPS");
   });
 });
