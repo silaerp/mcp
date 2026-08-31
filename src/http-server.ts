@@ -158,20 +158,10 @@ export async function main() {
           c.req.header("cookie"),
         );
         if (!identity) {
-          if (c.req.query("attempt") === "1") {
-            return authorizationErrorPage(
-              c,
-              "Dokploy sign-in could not be verified. Sign in to Dokploy in this browser, then restart the connector authorization.",
-              401,
-            );
-          }
-          const returnUrl = new URL(oauth.config.dokployBridgeUrl);
-          returnUrl.searchParams.set("tx", transactionId);
-          returnUrl.searchParams.set("nonce", nonce);
-          returnUrl.searchParams.set("attempt", "1");
-          const loginUrl = new URL(oauth.config.dokployLoginUrl);
-          loginUrl.searchParams.set(oauth.config.dokployLoginCallbackParam, returnUrl.toString());
-          return c.redirect(loginUrl.toString());
+          const continueUrl = new URL(oauth.config.dokployBridgeUrl);
+          continueUrl.searchParams.set("tx", transactionId);
+          continueUrl.searchParams.set("nonce", nonce);
+          return dokploySignInPage(c, oauth.config.dokployLoginUrl, continueUrl.toString());
         }
 
         const result = oauth.completeAuthorization(transactionId, nonce, identity);
@@ -411,6 +401,19 @@ function authorizationErrorPage(c: Context, message: string, status: 400 | 401 |
   return c.html(
     `<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>Dokploy authorization failed</title></head><body><main><h1>Dokploy authorization failed</h1><p>${escapeHtml(message)}</p></main></body></html>`,
     status,
+  );
+}
+
+function dokploySignInPage(c: Context, loginUrl: string, continueUrl: string) {
+  c.header("Cache-Control", "no-store");
+  c.header("Referrer-Policy", "no-referrer");
+  c.header(
+    "Content-Security-Policy",
+    "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+  );
+  return c.html(
+    `<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>Sign in to Dokploy</title><style>body{font:16px system-ui;max-width:42rem;margin:4rem auto;padding:0 1rem}a{display:inline-block;margin:.5rem .75rem .5rem 0;padding:.7rem 1rem;border:1px solid;border-radius:.4rem}</style></head><body><main><h1>Sign in to Dokploy</h1><p>Open Dokploy and sign in in the same browser. When the Dokploy dashboard is visible, return to this page and continue.</p><a href="${escapeHtml(loginUrl)}" target="_blank" rel="noopener noreferrer">Open Dokploy sign-in</a><a href="${escapeHtml(continueUrl)}">Continue after sign-in</a></main></body></html>`,
+    401,
   );
 }
 

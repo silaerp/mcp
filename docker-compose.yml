@@ -16,8 +16,7 @@ services:
       # Public Dokploy origin and the internal endpoint that accepts its browser session cookie.
       - DOKPLOY_PUBLIC_URL=${DOKPLOY_PUBLIC_URL:-https://your-dokploy-server.com}
       - DOKPLOY_SESSION_URL=${DOKPLOY_SESSION_URL:-}
-      - DOKPLOY_LOGIN_URL=${DOKPLOY_LOGIN_URL:-https://your-dokploy-server.com/login}
-      - DOKPLOY_LOGIN_CALLBACK_PARAM=${DOKPLOY_LOGIN_CALLBACK_PARAM:-callbackURL}
+      - DOKPLOY_LOGIN_URL=${DOKPLOY_LOGIN_URL:-https://your-dokploy-server.com/}
       # Route this public URL to /mcp-auth/verify on this service under the Dokploy hostname.
       - MCP_DOKPLOY_BRIDGE_URL=${MCP_DOKPLOY_BRIDGE_URL:-https://your-dokploy-server.com/mcp-auth/verify}
       # Comma-separated immutable Dokploy user IDs (or email addresses as a fallback).

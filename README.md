@@ -316,13 +316,12 @@ The configuration on Windows is slightly different compared to Linux or macOS. U
 | `DOKPLOY_RETRY_DELAY` | No | Delay between retries in milliseconds (default: `1000`) |
 | `MCP_OAUTH_ENABLED` | No | Enables OAuth 2.1 authorization backed by the current browser's Dokploy login session (default: `false`). |
 | `MCP_PUBLIC_URL` | With OAuth | Public origin of this MCP server, without the `/mcp` path (for example `https://mcp.example.com`). |
-| `MCP_OAUTH_TRUSTED_REDIRECT_URIS` | No | Comma-separated exact allowlist for hosted HTTPS client callbacks. Native-client HTTP callbacks on `localhost`, `127.0.0.1`, and `[::1]` are allowed automatically and remain exact after registration. |
+| `MCP_OAUTH_TRUSTED_REDIRECT_URIS` | No | Optional comma-separated exact allowlist for hosted HTTPS callbacks. Leave empty to permit HTTPS dynamic client registration; registered callbacks still remain exact. Loopback HTTP callbacks are allowed automatically. |
 | `DOKPLOY_PUBLIC_URL` | With OAuth | Public origin of the Dokploy dashboard whose browser session is used for sign-in. |
 | `DOKPLOY_SESSION_URL` | With OAuth | Fixed internal Dokploy session-verification endpoint (default: `<DOKPLOY_URL>/api/user.session`). It must accept the dashboard session cookie. |
-| `DOKPLOY_LOGIN_URL` | With OAuth | Dokploy browser login URL (default: `<DOKPLOY_PUBLIC_URL>/login`). |
-| `DOKPLOY_LOGIN_CALLBACK_PARAM` | No | Query parameter used by the Dokploy login page for its return URL (default: `callbackURL`). |
+| `DOKPLOY_LOGIN_URL` | With OAuth | Dokploy browser login URL (default: `<DOKPLOY_PUBLIC_URL>/`). |
 | `MCP_DOKPLOY_BRIDGE_URL` | With OAuth | Public `/mcp-auth/verify` URL on the Dokploy dashboard hostname, reverse-proxied to this service. |
-| `MCP_ALLOWED_DOKPLOY_USERS` | With OAuth | Comma-separated allowlist of immutable Dokploy user IDs, or lower-cased email addresses as a fallback. |
+| `MCP_ALLOWED_DOKPLOY_USERS` | With OAuth | Comma-separated allowlist of immutable Dokploy user IDs, or lower-cased email addresses as a fallback. Set to `*` only when every Dokploy user may use the shared API key's permissions. |
 | `DOKPLOY_REDACT_ENV` | No | Redacts secret-bearing fields (env vars, compose files, passwords, tokens, keys) from API responses before they reach the MCP client (default: `true`). Set to `false` only if you explicitly need raw secret values in LLM context. |
 | `DOKPLOY_REDACT_FIELDS` | No | Comma-separated list of response field names to redact when `DOKPLOY_REDACT_ENV=true`. Matched case-insensitively at any nesting depth. Defaults to: `env`, `buildArgs`, `composeFile`, `dockerCompose`, `environment`, `buildSecrets`, `previewBuildSecrets`, `password`, `currentPassword`, `appPassword`, `databasePassword`, `databaseRootPassword`, `redisPassword`, `mariadbPassword`, `mongoPassword`, `mysqlPassword`, `postgresPassword`, `registryPassword`, `token`, `accessToken`, `appToken`, `apiToken`, `botToken`, `refreshToken`, `secret`, `clientSecret`, `apiKey`, `secretAccessKey`, `accessKey`, `licenseKey`, `userKey`, `privateKey`, `privateKeyPass`, `encPrivateKey`, `encPrivateKeyPass`, `sshKey`, `sshPrivateKey`, `customGitSSHKey`, `dockerAuth`. |
 
@@ -393,16 +392,26 @@ remains server-side and is never used to verify the browser session. Access toke
 clients, and pending sign-ins are intentionally kept in memory; restarting the container signs
 clients out.
 
+If the browser has no current Dokploy session, the bridge shows a page that opens the real Dokploy
+sign-in screen in a new tab. After the dashboard opens, return to the bridge page and select
+**Continue after sign-in**. Dokploy's current login page always returns to its dashboard, so the
+bridge does not depend on an unsupported login callback query parameter.
+
 ```env
 MCP_OAUTH_ENABLED=true
 MCP_PUBLIC_URL=https://mcp.example.com
 MCP_OAUTH_TRUSTED_REDIRECT_URIS=https://hosted-client.example.com/oauth/callback
 DOKPLOY_PUBLIC_URL=https://dokploy.example.com
 DOKPLOY_SESSION_URL=http://dokploy:3000/api/user.session
-DOKPLOY_LOGIN_URL=https://dokploy.example.com/login
+DOKPLOY_LOGIN_URL=https://dokploy.example.com/
 MCP_DOKPLOY_BRIDGE_URL=https://dokploy.example.com/mcp-auth/verify
 MCP_ALLOWED_DOKPLOY_USERS=immutable-user-id
 ```
+
+To migrate an existing API-key OAuth deployment, keep `DOKPLOY_URL`, `DOKPLOY_API_KEY`,
+`MCP_OAUTH_ENABLED`, and `MCP_PUBLIC_URL`, then add the Dokploy public, session, login, bridge, and
+allowed-user settings above.
+`MCP_OAUTH_TRUSTED_REDIRECT_URIS` may remain empty when the MCP client uses dynamic registration.
 
 Configure the reverse proxy so that only
 `https://dokploy.example.com/mcp-auth/verify` is routed to `/mcp-auth/verify` on this MCP service.
@@ -410,9 +419,10 @@ The Dokploy hostname is intentional: a host-only Dokploy session cookie is not s
 hostname. Do not widen the session cookie domain. Confirm that the deployed Dokploy version's
 session endpoint accepts its browser cookie and returns a user object before enabling OAuth.
 
-Hosted HTTPS callbacks must exactly match the trusted allowlist; do not use wildcards. Loopback
-HTTP callbacks are accepted automatically so native clients can choose an ephemeral port, then
-must match that registered URI exactly during authorization and token exchange. Put the server
+When `MCP_OAUTH_TRUSTED_REDIRECT_URIS` is populated, hosted HTTPS callbacks must exactly match it;
+do not use wildcards. Leave it empty for clients such as ChatGPT that dynamically register their
+HTTPS callback. Every callback remains bound exactly to its generated client ID. Loopback HTTP
+callbacks are accepted automatically for native clients. Put the server
 behind HTTPS in production and keep port `3000` private when terminating TLS at a reverse proxy.
 `MCP_PUBLIC_URL` must be an HTTPS origin in production and the MCP resource is always its `/mcp`
 URL. This lightweight flow is intended for a single trusted Dokploy operator; use a persistent

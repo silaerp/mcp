@@ -14,8 +14,7 @@ function provider() {
     trustedRedirectUris: new Set([redirectUri]),
     dokployPublicUrl: "https://dokploy.example",
     dokploySessionUrl: "http://dokploy:3000/api/user.session",
-    dokployLoginUrl: "https://dokploy.example/login",
-    dokployLoginCallbackParam: "callbackURL",
+    dokployLoginUrl: "https://dokploy.example/",
     dokployBridgeUrl: "https://dokploy.example/mcp-auth/verify",
     allowedDokployUsers: new Set(["user-1", "admin@example.com"]),
   });
@@ -40,6 +39,14 @@ describe("LightweightOAuthProvider", () => {
     expect(() => oauth.register(["https://evil.example/callback"])).toThrow(
       "MCP_OAUTH_TRUSTED_REDIRECT_URIS",
     );
+  });
+
+  it("allows hosted dynamic registration when no callback allowlist is configured", () => {
+    const oauth = provider();
+    oauth.config.trustedRedirectUris.clear();
+    expect(oauth.register(["https://chatgpt.com/connector/callback"]).redirectUris).toEqual([
+      "https://chatgpt.com/connector/callback",
+    ]);
   });
 
   it("allows dynamic loopback ports for native MCP clients", () => {
@@ -95,6 +102,15 @@ describe("LightweightOAuthProvider", () => {
         id: "other",
         email: "ADMIN@example.com",
       }).code,
+    ).toBeTruthy();
+  });
+
+  it("supports an explicit wildcard for deployments that trust every Dokploy user", () => {
+    const oauth = provider();
+    oauth.config.allowedDokployUsers = new Set(["*"]);
+    const { pending } = authorization(oauth);
+    expect(
+      oauth.completeAuthorization(pending.transactionId, pending.nonce, { id: "any-user" }).code,
     ).toBeTruthy();
   });
 

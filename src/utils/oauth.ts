@@ -14,7 +14,6 @@ export interface OAuthConfig {
   dokployPublicUrl: string;
   dokploySessionUrl: string;
   dokployLoginUrl: string;
-  dokployLoginCallbackParam: string;
   dokployBridgeUrl: string;
   allowedDokployUsers: Set<string>;
 }
@@ -200,13 +199,18 @@ export class LightweightOAuthProvider {
   }
 
   private isAllowedIdentity(identity: DokployIdentity): boolean {
+    if (this.config.allowedDokployUsers.has("*")) return true;
     const candidates = [identity.id, identity.email?.toLowerCase()].filter(Boolean) as string[];
     return candidates.some((candidate) => this.config.allowedDokployUsers.has(candidate));
   }
 
   private isTrustedRedirectUri(redirectUri: string): boolean {
     const url = new URL(redirectUri);
-    return isLoopbackUrl(url) || this.config.trustedRedirectUris.has(redirectUri);
+    return (
+      isLoopbackUrl(url) ||
+      this.config.trustedRedirectUris.size === 0 ||
+      this.config.trustedRedirectUris.has(redirectUri)
+    );
   }
 }
 
@@ -231,7 +235,7 @@ export function loadOAuthConfig(): OAuthConfig {
     "DOKPLOY_SESSION_URL",
   );
   const dokployLoginUrl = normalizeServiceUrl(
-    process.env.DOKPLOY_LOGIN_URL ?? `${dokployPublicUrl}/login`,
+    process.env.DOKPLOY_LOGIN_URL ?? `${dokployPublicUrl}/`,
     "DOKPLOY_LOGIN_URL",
   );
   const dokployBridgeUrl = normalizeServiceUrl(
@@ -254,7 +258,6 @@ export function loadOAuthConfig(): OAuthConfig {
     dokployPublicUrl,
     dokploySessionUrl,
     dokployLoginUrl,
-    dokployLoginCallbackParam: process.env.DOKPLOY_LOGIN_CALLBACK_PARAM?.trim() || "callbackURL",
     dokployBridgeUrl,
     allowedDokployUsers,
   };
