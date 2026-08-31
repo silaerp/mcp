@@ -3,6 +3,7 @@ import type { MiddlewareHandler } from "hono";
 
 const TOKEN_TTL_MS = 8 * 60 * 60 * 1000;
 const CODE_TTL_MS = 5 * 60 * 1000;
+const AUTHORIZATION_TTL_MS = 5 * 60 * 1000;
 const MAX_EPHEMERAL_RECORDS = 1_000;
 
 export interface OAuthConfig {
@@ -10,12 +11,32 @@ export interface OAuthConfig {
   issuer: string;
   resource: string;
   trustedRedirectUris: Set<string>;
-  dokployApiKey: string;
+  dokployPublicUrl: string;
+  dokploySessionUrl: string;
+  dokployLoginUrl: string;
+  dokployBridgeUrl: string;
+  allowedDokployUsers: Set<string>;
+}
+
+export interface DokployIdentity {
+  id: string;
+  email?: string | undefined;
+  name?: string | undefined;
 }
 
 interface Client {
   clientId: string;
   redirectUris: string[];
+}
+
+interface PendingAuthorization {
+  clientId: string;
+  redirectUri: string;
+  state?: string | undefined;
+  codeChallenge: string;
+  resource: string;
+  nonceHash: string;
+  expiresAt: number;
 }
 
 interface AuthorizationCode {
@@ -28,6 +49,7 @@ interface AuthorizationCode {
 
 export class LightweightOAuthProvider {
   private readonly clients = new Map<string, Client>();
+  private readonly pendingAuthorizations = new Map<string, PendingAuthorization>();
   private readonly codes = new Map<string, AuthorizationCode>();
   private readonly tokens = new Map<string, { expiresAt: number; resource: string }>();
 
@@ -49,13 +71,13 @@ export class LightweightOAuthProvider {
     return client;
   }
 
-  createCode(input: {
+  beginAuthorization(input: {
     clientId: string;
     redirectUri: string;
+    state?: string | undefined;
     codeChallenge: string;
     resource: string;
-    dokployApiKey: string;
-  }): string {
+  }): { transactionId: string; nonce: string } {
     const redirectUri = normalizeRedirectUri(input.redirectUri);
     if (!this.isClientRedirectUri(input.clientId, redirectUri)) {
       throw new Error("Unknown client or unregistered redirect URI");
@@ -63,22 +85,62 @@ export class LightweightOAuthProvider {
     if (!/^[A-Za-z0-9_-]{43,128}$/.test(input.codeChallenge)) {
       throw new Error("A valid PKCE S256 code_challenge is required");
     }
-    if (!secretEquals(input.dokployApiKey, this.config.dokployApiKey)) {
-      throw new Error("Invalid Dokploy API key");
-    }
     if (input.resource !== this.config.resource) {
       throw new Error(`resource must be ${this.config.resource}`);
     }
-    const code = randomToken();
-    this.codes.set(code, {
+
+    const transactionId = randomToken();
+    const nonce = randomToken();
+    this.pendingAuthorizations.set(transactionId, {
       clientId: input.clientId,
       redirectUri,
+      state: input.state,
       codeChallenge: input.codeChallenge,
       resource: input.resource,
+      nonceHash: hashToken(nonce),
+      expiresAt: Date.now() + AUTHORIZATION_TTL_MS,
+    });
+    capMap(this.pendingAuthorizations);
+    return { transactionId, nonce };
+  }
+
+  completeAuthorization(
+    transactionId: string,
+    nonce: string,
+    identity: DokployIdentity,
+  ): { code: string; redirectUri: string; state?: string | undefined } {
+    const pending = this.pendingAuthorizations.get(transactionId);
+    if (
+      !pending ||
+      pending.expiresAt < Date.now() ||
+      !secretEquals(pending.nonceHash, hashToken(nonce))
+    ) {
+      throw new Error("Invalid or expired Dokploy authorization transaction");
+    }
+    if (!this.isAllowedIdentity(identity)) {
+      throw new Error("This Dokploy user is not allowed to access the MCP server");
+    }
+
+    this.pendingAuthorizations.delete(transactionId);
+    const code = randomToken();
+    this.codes.set(code, {
+      clientId: pending.clientId,
+      redirectUri: pending.redirectUri,
+      codeChallenge: pending.codeChallenge,
+      resource: pending.resource,
       expiresAt: Date.now() + CODE_TTL_MS,
     });
     capMap(this.codes);
-    return code;
+    return { code, redirectUri: pending.redirectUri, state: pending.state };
+  }
+
+  hasPendingAuthorization(transactionId: string, nonce: string): boolean {
+    const pending = this.pendingAuthorizations.get(transactionId);
+    return Boolean(
+      pending &&
+        pending.expiresAt >= Date.now() &&
+        secretEquals(pending.nonceHash, hashToken(nonce)),
+    );
   }
 
   exchangeCode(input: {
@@ -136,33 +198,68 @@ export class LightweightOAuthProvider {
     }
   }
 
+  private isAllowedIdentity(identity: DokployIdentity): boolean {
+    if (this.config.allowedDokployUsers.has("*")) return true;
+    const candidates = [identity.id, identity.email?.toLowerCase()].filter(Boolean) as string[];
+    return candidates.some((candidate) => this.config.allowedDokployUsers.has(candidate));
+  }
+
   private isTrustedRedirectUri(redirectUri: string): boolean {
     const url = new URL(redirectUri);
-    return isLoopbackUrl(url) || this.config.trustedRedirectUris.has(redirectUri);
+    return (
+      isLoopbackUrl(url) ||
+      this.config.trustedRedirectUris.size === 0 ||
+      this.config.trustedRedirectUris.has(redirectUri)
+    );
   }
 }
 
 export function loadOAuthConfig(): OAuthConfig {
   const enabled = parseBoolean(process.env.MCP_OAUTH_ENABLED);
-  const issuerUrl = normalizeIssuer(process.env.MCP_PUBLIC_URL ?? "http://localhost:3000");
+  const issuerUrl = normalizeOrigin(
+    process.env.MCP_PUBLIC_URL ?? "http://localhost:3000",
+    "MCP_PUBLIC_URL",
+  );
   const issuer = issuerUrl.toString().replace(/\/$/, "");
   const resource = `${issuer}/mcp`;
-  const trustedRedirectUris = new Set(
-    (process.env.MCP_OAUTH_TRUSTED_REDIRECT_URIS ?? "")
-      .split(",")
-      .map((uri) => uri.trim())
-      .filter(Boolean)
-      .map(normalizeRedirectUri),
+  const dokployPublicUrl = normalizeOrigin(
+    process.env.DOKPLOY_PUBLIC_URL ?? process.env.DOKPLOY_URL ?? "http://localhost:3000",
+    "DOKPLOY_PUBLIC_URL",
+    enabled,
+  )
+    .toString()
+    .replace(/\/$/, "");
+  const dokploySessionUrl = normalizeServiceUrl(
+    nonEmpty(process.env.DOKPLOY_SESSION_URL) ??
+      `${(process.env.DOKPLOY_URL ?? dokployPublicUrl).replace(/\/$/, "")}/api/user.session`,
+    "DOKPLOY_SESSION_URL",
   );
-  if (enabled && !process.env.DOKPLOY_API_KEY) {
-    throw new Error("DOKPLOY_API_KEY is required when MCP_OAUTH_ENABLED=true");
+  const dokployLoginUrl = normalizeServiceUrl(
+    process.env.DOKPLOY_LOGIN_URL ?? `${dokployPublicUrl}/`,
+    "DOKPLOY_LOGIN_URL",
+  );
+  const dokployBridgeUrl = normalizeServiceUrl(
+    process.env.MCP_DOKPLOY_BRIDGE_URL ?? `${dokployPublicUrl}/mcp-auth/verify`,
+    "MCP_DOKPLOY_BRIDGE_URL",
+  );
+  const allowedDokployUsers = new Set(
+    splitList(process.env.MCP_ALLOWED_DOKPLOY_USERS).map((value) => value.toLowerCase()),
+  );
+  if (enabled && allowedDokployUsers.size === 0) {
+    throw new Error("MCP_ALLOWED_DOKPLOY_USERS is required when MCP_OAUTH_ENABLED=true");
   }
   return {
     enabled,
     issuer,
     resource,
-    trustedRedirectUris,
-    dokployApiKey: process.env.DOKPLOY_API_KEY ?? "",
+    trustedRedirectUris: new Set(
+      splitList(process.env.MCP_OAUTH_TRUSTED_REDIRECT_URIS).map(normalizeRedirectUri),
+    ),
+    dokployPublicUrl,
+    dokploySessionUrl,
+    dokployLoginUrl,
+    dokployBridgeUrl,
+    allowedDokployUsers,
   };
 }
 
@@ -193,18 +290,23 @@ function normalizeRedirectUri(value: unknown): string {
   return url.toString();
 }
 
-function normalizeIssuer(value: string): URL {
+function normalizeOrigin(value: string, name: string, requireHttps = true): URL {
   const url = new URL(value);
-  if (url.search || url.hash || url.username || url.password) {
-    throw new Error("MCP_PUBLIC_URL cannot contain credentials, a query, or a fragment");
+  if (url.search || url.hash || url.username || url.password || url.pathname !== "/") {
+    throw new Error(`${name} must be an origin without credentials, a path, query, or fragment`);
   }
-  if (url.pathname !== "/") {
-    throw new Error("MCP_PUBLIC_URL must be an origin without a path");
-  }
-  if (url.protocol !== "https:" && !isLoopbackUrl(url)) {
-    throw new Error("MCP_PUBLIC_URL must use HTTPS except on localhost or 127.0.0.1");
+  if (requireHttps && url.protocol !== "https:" && !isLoopbackUrl(url)) {
+    throw new Error(`${name} must use HTTPS except on localhost or 127.0.0.1`);
   }
   return url;
+}
+
+function normalizeServiceUrl(value: string, name: string): string {
+  const url = new URL(value);
+  if (url.username || url.password || url.hash || !["http:", "https:"].includes(url.protocol)) {
+    throw new Error(`${name} must be an HTTP(S) URL without credentials or a fragment`);
+  }
+  return url.toString();
 }
 
 function isLoopbackUrl(url: URL): boolean {
@@ -215,6 +317,10 @@ function randomToken(): string {
   return randomBytes(32).toString("base64url");
 }
 
+function hashToken(value: string): string {
+  return createHash("sha256").update(value).digest("base64url");
+}
+
 function secretEquals(left: string, right: string): boolean {
   const leftBuffer = Buffer.from(left);
   const rightBuffer = Buffer.from(right);
@@ -223,6 +329,17 @@ function secretEquals(left: string, right: string): boolean {
 
 function parseBoolean(value: string | undefined): boolean {
   return ["true", "1", "yes", "on"].includes(value?.trim().toLowerCase() ?? "");
+}
+
+function splitList(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function nonEmpty(value: string | undefined): string | undefined {
+  return value?.trim() || undefined;
 }
 
 function capMap<TKey, TValue>(map: Map<TKey, TValue>): void {

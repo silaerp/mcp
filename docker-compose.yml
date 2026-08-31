@@ -8,24 +8,20 @@ services:
       - MCP_TRANSPORT=${MCP_TRANSPORT:-http}
       - DOKPLOY_URL=${DOKPLOY_URL:-https://your-dokploy-server.com}
       - DOKPLOY_API_KEY=${DOKPLOY_API_KEY:-your_token_here}
-      # Lightweight single-operator OAuth 2.1. Authorization uses the Dokploy API key.
+      # OAuth 2.1 with Dokploy browser-session verification.
       - MCP_OAUTH_ENABLED=${MCP_OAUTH_ENABLED:-false}
       - MCP_PUBLIC_URL=${MCP_PUBLIC_URL:-http://localhost:3000}
       # Exact trusted HTTPS callbacks. Loopback HTTP callbacks are allowed automatically.
       - MCP_OAUTH_TRUSTED_REDIRECT_URIS=${MCP_OAUTH_TRUSTED_REDIRECT_URIS:-}
+      # Public Dokploy origin and the internal endpoint that accepts its browser session cookie.
+      - DOKPLOY_PUBLIC_URL=${DOKPLOY_PUBLIC_URL:-https://your-dokploy-server.com}
+      - DOKPLOY_SESSION_URL=${DOKPLOY_SESSION_URL:-}
+      - DOKPLOY_LOGIN_URL=${DOKPLOY_LOGIN_URL:-https://your-dokploy-server.com/}
+      # Route this public URL to /mcp-auth/verify on this service under the Dokploy hostname.
+      - MCP_DOKPLOY_BRIDGE_URL=${MCP_DOKPLOY_BRIDGE_URL:-https://your-dokploy-server.com/mcp-auth/verify}
+      # Comma-separated immutable Dokploy user IDs (or email addresses as a fallback).
+      - MCP_ALLOWED_DOKPLOY_USERS=${MCP_ALLOWED_DOKPLOY_USERS:-}
     restart: unless-stopped
-    networks:
-      - mcp-network
-
-  dokploy-mcp-stdio:
-    build: .
-    container_name: dokploy-mcp-stdio
-    environment:
-      - DOKPLOY_URL=${DOKPLOY_URL:-https://your-dokploy-server.com}
-      - DOKPLOY_API_KEY=${DOKPLOY_API_KEY:-your_token_here}
-    restart: "no"
-    stdin_open: true
-    tty: true
     networks:
       - mcp-network
 

@@ -8,6 +8,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { type Context, Hono } from "hono";
 import { createServer } from "./server.js";
+import { verifyDokploySession } from "./utils/dokploySession.js";
 import { createLogger } from "./utils/logger.js";
 import { LightweightOAuthProvider, loadOAuthConfig, oauthMiddleware } from "./utils/oauth.js";
 
@@ -110,20 +111,10 @@ export async function main() {
       }
     });
     app.get("/oauth/authorize", (c) => {
-      const query = new URLSearchParams(c.req.query()).toString();
-      c.header("Cache-Control", "no-store");
-      c.header("Referrer-Policy", "no-referrer");
-      c.header(
-        "Content-Security-Policy",
-        "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
-      );
-      return c.html(
-        `<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>Authorize Dokploy MCP</title></head><body><main><h1>Authorize Dokploy MCP</h1><p>Enter the API key for this Dokploy MCP deployment. This is single-operator API-key authorization, not a Dokploy account or SSO login. The key is checked in constant time and is never stored.</p><p>After approval, you will return to <strong>${escapeHtml(callbackHost(c.req.query("redirect_uri")))}</strong>.</p><form method="post" action="/oauth/authorize?${escapeHtml(query)}"><label>Dokploy API key <input name="dokploy_api_key" type="password" required autocomplete="off"></label><button type="submit">Authorize</button></form></main></body></html>`,
-      );
-    });
-    app.post("/oauth/authorize", async (c) => {
       const redirectUri = c.req.query("redirect_uri") ?? "";
       const state = c.req.query("state");
+      c.header("Cache-Control", "no-store");
+      c.header("Referrer-Policy", "no-referrer");
       try {
         if (
           c.req.query("response_type") !== "code" ||
@@ -133,30 +124,63 @@ export async function main() {
         if (!oauth.isClientRedirectUri(c.req.query("client_id") ?? "", redirectUri)) {
           throw new Error("Unknown client or unregistered redirect URI");
         }
-        const form = await c.req.parseBody();
-        const code = oauth.createCode({
+        const pending = oauth.beginAuthorization({
           clientId: c.req.query("client_id") ?? "",
           redirectUri,
           codeChallenge: c.req.query("code_challenge") ?? "",
           resource: c.req.query("resource") ?? "",
-          dokployApiKey: String(form.dokploy_api_key ?? ""),
+          state,
         });
-        const target = new URL(redirectUri);
-        target.searchParams.set("code", code);
-        if (state) target.searchParams.set("state", state);
+        const target = new URL(oauth.config.dokployBridgeUrl);
+        target.searchParams.set("tx", pending.transactionId);
+        target.searchParams.set("nonce", pending.nonce);
         return c.redirect(target.toString());
       } catch (error) {
         const message = error instanceof Error ? error.message : "Authorization failed";
         if (oauth.isClientRedirectUri(c.req.query("client_id") ?? "", redirectUri)) {
-          return redirectOAuthError(
-            c,
-            redirectUri,
-            state,
-            message === "Invalid Dokploy API key" ? "access_denied" : "invalid_request",
-            message,
-          );
+          return redirectOAuthError(c, redirectUri, state, "invalid_request", message);
         }
         return c.text(message, 400);
+      }
+    });
+    app.get("/mcp-auth/verify", async (c) => {
+      c.header("Cache-Control", "no-store");
+      c.header("Referrer-Policy", "no-referrer");
+      const transactionId = c.req.query("tx") ?? "";
+      const nonce = c.req.query("nonce") ?? "";
+      if (!oauth.hasPendingAuthorization(transactionId, nonce)) {
+        return c.text("Invalid or expired Dokploy authorization transaction", 400);
+      }
+
+      try {
+        const identity = await verifyDokploySession(
+          oauth.config.dokploySessionUrl,
+          c.req.header("cookie"),
+        );
+        if (!identity) {
+          const continueUrl = new URL(oauth.config.dokployBridgeUrl);
+          continueUrl.searchParams.set("tx", transactionId);
+          continueUrl.searchParams.set("nonce", nonce);
+          return dokploySignInPage(c, oauth.config.dokployLoginUrl, continueUrl.toString());
+        }
+
+        const result = oauth.completeAuthorization(transactionId, nonce, identity);
+        const target = new URL(result.redirectUri);
+        target.searchParams.set("code", result.code);
+        if (result.state) target.searchParams.set("state", result.state);
+        return c.redirect(target.toString());
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("not allowed")) {
+          return authorizationErrorPage(c, error.message, 403);
+        }
+        logger.error("Dokploy session verification failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return authorizationErrorPage(
+          c,
+          "Dokploy session verification is temporarily unavailable.",
+          502,
+        );
       }
     });
     app.post("/oauth/token", async (c) => {
@@ -368,12 +392,29 @@ function escapeHtml(value: string): string {
   );
 }
 
-function callbackHost(value: string | undefined): string {
-  try {
-    return value ? new URL(value).host : "the requesting MCP client";
-  } catch {
-    return "the requesting MCP client";
-  }
+function authorizationErrorPage(c: Context, message: string, status: 400 | 401 | 403 | 502) {
+  c.header("Cache-Control", "no-store");
+  c.header(
+    "Content-Security-Policy",
+    "default-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+  );
+  return c.html(
+    `<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>Dokploy authorization failed</title></head><body><main><h1>Dokploy authorization failed</h1><p>${escapeHtml(message)}</p></main></body></html>`,
+    status,
+  );
+}
+
+function dokploySignInPage(c: Context, loginUrl: string, continueUrl: string) {
+  c.header("Cache-Control", "no-store");
+  c.header("Referrer-Policy", "no-referrer");
+  c.header(
+    "Content-Security-Policy",
+    "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+  );
+  return c.html(
+    `<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>Sign in to Dokploy</title><style>body{font:16px system-ui;max-width:42rem;margin:4rem auto;padding:0 1rem}a{display:inline-block;margin:.5rem .75rem .5rem 0;padding:.7rem 1rem;border:1px solid;border-radius:.4rem}</style></head><body><main><h1>Sign in to Dokploy</h1><p>Open Dokploy and sign in in the same browser. When the Dokploy dashboard is visible, return to this page and continue.</p><a href="${escapeHtml(loginUrl)}" target="_blank" rel="noopener noreferrer">Open Dokploy sign-in</a><a href="${escapeHtml(continueUrl)}">Continue after sign-in</a></main></body></html>`,
+    401,
+  );
 }
 
 function redirectOAuthError(
